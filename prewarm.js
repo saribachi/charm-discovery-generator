@@ -10,8 +10,7 @@ import {
   customFieldNames,
   domainResolves,
 } from './ghl.js';
-import { generateDeckData } from './research.js';
-import { saveDeck, getDeck, listDecks } from './store.js';
+import { listDecks, createJob } from './store.js';
 import { sendDigest } from './slack.js';
 
 const TZ = process.env.PREWARM_TZ || 'America/Los_Angeles';
@@ -20,9 +19,6 @@ const TZ = process.env.PREWARM_TZ || 'America/Los_Angeles';
 // stale fast and that is the whole premise of the pitch.
 const FRESH_DAYS = Number(process.env.PREWARM_FRESH_DAYS || 14);
 
-// Domains never worth generating: internal test bookings and the like. A
-// reachability check cannot catch these because they are really registered.
-// Comma separated, e.g. PREWARM_SKIP_DOMAINS=troll.com,example.com
 // Manual email to domain mapping, for people who book from a personal address.
 // Without this they are skipped forever, because guessing a company from a
 // gmail address produces confidently wrong decks. Format:
@@ -35,21 +31,15 @@ const EMAIL_OVERRIDES = new Map(
     .map(([email, domain]) => [email.trim().toLowerCase(), domain.trim().toLowerCase()])
 );
 
+// Domains never worth generating: internal test bookings and the like. A
+// reachability check cannot catch these because they are really registered.
+// Comma separated, e.g. PREWARM_SKIP_DOMAINS=troll.com,example.com
 const SKIP_DOMAINS = new Set(
   (process.env.PREWARM_SKIP_DOMAINS || 'troll.com,example.com,test.com')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
 );
-
-function slugify(company, domain) {
-  const base = (company || domain)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 40);
-  return base || domain.replace(/\./g, '-');
-}
 
 let running = false;
 let lastRunDate = null;
@@ -64,7 +54,7 @@ export async function runPrewarm({ dryRun = false, notify = false } = {}) {
   if (running) return { skipped: 'already running' };
   running = true;
   const started = Date.now();
-  const report = { date: null, meetings: 0, generated: [], reused: [], skipped: [], failed: [] };
+  const report = { date: null, meetings: 0, generated: [], queued: [], reused: [], skipped: [], failed: [] };
 
   try {
     const { date, appointments: raw } = await todaysAppointments(TZ);
@@ -156,20 +146,15 @@ export async function runPrewarm({ dryRun = false, notify = false } = {}) {
         continue;
       }
 
+      // The server holds no API key and never generates. It queues, and the
+      // Mac running Claude Code on the subscription drains the queue.
       try {
-        console.log(`prewarm: generating ${domain} (via ${via})`);
-        const data = await generateDeckData(domain, (m) => console.log(`  ${domain}: ${m}`));
-        const company = data.company?.name || domain;
-        let slug = slugify(company, domain);
-        // Do not clobber an unrelated older deck that happens to share a slug.
-        const clash = await getDeck(slug);
-        if (clash && clash.domain !== domain) slug = `${slug}-${domain.split('.')[0]}`;
-        await saveDeck({ slug, domain, company, data });
-        report.generated.push({ when, title, domain, via, slug, company });
-        console.log(`prewarm: done ${domain} -> /d/${slug}`);
+        const { job, reused } = await createJob(domain);
+        report.queued.push({ when, title, domain, via, jobId: job.id });
+        console.log(`prewarm: ${reused ? 'already queued' : 'queued'} ${domain} (via ${via})`);
       } catch (err) {
         report.failed.push({ when, title, domain, error: err.message });
-        console.error(`prewarm: FAILED ${domain}: ${err.message}`);
+        console.error(`prewarm: could not queue ${domain}: ${err.message}`);
       }
     }
 
@@ -184,7 +169,7 @@ export async function runPrewarm({ dryRun = false, notify = false } = {}) {
   report.elapsedSec = Math.round((Date.now() - started) / 1000);
   console.log(
     `prewarm: finished in ${report.elapsedSec}s. ` +
-      `generated=${report.generated.length} reused=${report.reused.length} ` +
+      `queued=${report.queued.length} reused=${report.reused.length} ` +
       `skipped=${report.skipped.length} failed=${report.failed.length}`
   );
 

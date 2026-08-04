@@ -69,16 +69,85 @@ async function serverSession() {
   return cookie;
 }
 
+// Claim and run queued jobs one at a time until the queue is empty. Each job
+// reports progress back so the browser tab that asked for it sees movement.
+async function drainJobs(cookie) {
+  for (let i = 0; i < 10; i++) {
+    const res = await fetch(`${BASE}/api/jobs/claim`, { method: 'POST', headers: { cookie } });
+    if (!res.ok) { log(`  could not claim a job: ${res.status}`); return; }
+    const { job } = await res.json();
+    if (!job) return;
+
+    const patch = (body) =>
+      fetch(`${BASE}/api/jobs/${job.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', cookie },
+        body: JSON.stringify(body),
+      }).catch(() => {});
+
+    const started = Date.now();
+    log(`  job ${job.id}: generating ${job.domain}`);
+    try {
+      await patch({ note: `Researching ${job.domain} on the Mac. This takes a few minutes.` });
+      const { deck, cost, turns } = await generateDeck(job.domain);
+
+      const company = deck.company?.name || job.domain;
+      const slug = (company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40)) ||
+        job.domain.replace(/\./g, '-');
+
+      const imp = await fetch(`${BASE}/api/decks/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', cookie },
+        body: JSON.stringify({ slug, domain: job.domain, company, data: deck }),
+      });
+      const body = await imp.json().catch(() => ({}));
+      if (!imp.ok || !body.ok) throw new Error(`import failed: ${imp.status}`);
+
+      await patch({ status: 'done', slug, note: `Ready: ${company}` });
+      log(`  job ${job.id}: done in ${Math.round((Date.now() - started) / 1000)}s, ${turns} turns -> ${BASE}${body.url}`);
+    } catch (err) {
+      await patch({ status: 'failed', error: err.message, note: `Failed: ${err.message}` });
+      log(`  job ${job.id}: FAILED ${err.message}`);
+    }
+  }
+}
+
+// The queue is drained every couple of minutes so a request from the browser
+// is picked up quickly. The GHL calendar check is far less urgent and is rate
+// limited to this interval so we are not hitting their API 30 times an hour.
+const GHL_CHECK_EVERY_MIN = Number(process.env.PREWARM_GHL_CHECK_MIN ?? 20);
+const STAMP = new URL('./.last-ghl-check', import.meta.url).pathname;
+
+async function ghlCheckDue() {
+  try {
+    const { mtimeMs } = await (await import('fs/promises')).stat(STAMP);
+    return Date.now() - mtimeMs > GHL_CHECK_EVERY_MIN * 60000;
+  } catch {
+    return true; // never run before
+  }
+}
+async function markGhlChecked() {
+  const fs = await import('fs/promises');
+  await fs.writeFile(STAMP, new Date().toISOString());
+}
+
 async function main() {
   const hour = hourIn(TZ);
   if (CATCH_UP && (hour < ACTIVE_FROM || hour >= ACTIVE_UNTIL)) {
-    // Quiet exit: this runs every 30 minutes and should say nothing overnight.
+    // Quiet exit: this runs often and should say nothing overnight.
     return;
   }
   if (!process.env.GHL_TOKEN || !process.env.GHL_LOCATION_ID) {
     throw new Error('GHL credentials not found in Keychain (charm-discovery / ghl-token, ghl-location)');
   }
   const cookie = await serverSession();
+
+  // Always drain the queue: this is the cheap, time-sensitive half.
+  if (!DRY) await drainJobs(cookie);
+
+  // The calendar half runs on its own slower clock.
+  if (CATCH_UP && !(await ghlCheckDue())) return;
+  if (CATCH_UP) await markGhlChecked();
 
   const dryRes = await fetch(`${BASE}/api/prewarm/dry`, { headers: { cookie } });
   if (!dryRes.ok) throw new Error(`server dry run failed: ${dryRes.status}`);

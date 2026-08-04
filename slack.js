@@ -41,6 +41,11 @@ export function buildDigest(report, tz = 'America/Los_Angeles') {
   const ready = [...(report.generated || []), ...(report.reused || [])].sort((a, b) =>
     String(a.when).localeCompare(String(b.when))
   );
+  // Queued means the request is waiting on the Mac, which is a different state
+  // from "we cannot do this", so it gets its own section.
+  const queued = [...(report.queued || [])].sort((a, b) =>
+    String(a.when).localeCompare(String(b.when))
+  );
   const problems = [
     ...(report.skipped || []).map((s) => ({ ...s, kind: 'skipped' })),
     ...(report.failed || []).map((f) => ({ ...f, kind: 'failed' })),
@@ -52,6 +57,7 @@ export function buildDigest(report, tz = 'America/Los_Angeles') {
   const n = report.meetings || 0;
   lines.push(
     `${n} meeting${n === 1 ? '' : 's'} · ${ready.length} deck${ready.length === 1 ? '' : 's'} ready` +
+      (queued.length ? ` · ${queued.length} building` : '') +
       (problems.length ? ` · ${problems.length} need${problems.length === 1 ? 's' : ''} a look` : '')
   );
 
@@ -61,6 +67,15 @@ export function buildDigest(report, tz = 'America/Los_Angeles') {
     for (const r of ready) {
       const who = (r.title || '').replace(/\s*&\s*Charm\s*$/i, '').replace(/\s+/g, ' ').trim() || r.domain;
       lines.push(`• ${timeLabel(r.when, tz)}  ${who} · ${r.domain}  <${BASE_URL}/d/${r.slug}|open deck>`);
+    }
+  }
+
+  if (queued.length) {
+    lines.push('');
+    lines.push('*Building*');
+    for (const q of queued) {
+      const who = (q.title || '').replace(/\s*&\s*Charm\s*$/i, '').replace(/\s+/g, ' ').trim() || q.domain;
+      lines.push(`• ${timeLabel(q.when, tz)}  ${who} · ${q.domain}  _queued, generating on the Mac_`);
     }
   }
 
@@ -77,7 +92,7 @@ export function buildDigest(report, tz = 'America/Los_Angeles') {
     }
   }
 
-  if (!ready.length && !problems.length) {
+  if (!ready.length && !problems.length && !queued.length) {
     lines.push('');
     lines.push('_No meetings booked today._');
   }

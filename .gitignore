@@ -3,3 +3,4 @@ data/
 .env
 .DS_Store
 local/prewarm.log
+local/.last-ghl-check

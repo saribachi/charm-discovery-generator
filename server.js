@@ -3,8 +3,10 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { initStore, saveDeck, getDeck, listDecks, deleteDeck } from './store.js';
-import { generateDeckData } from './research.js';
+import {
+  initStore, saveDeck, getDeck, listDecks, deleteDeck,
+  createJob, getJob, listJobs, claimJob, updateJob, requeueStale,
+} from './store.js';
 import { renderDeck } from './deck.js';
 import { runPrewarm, startScheduler, prewarmState } from './prewarm.js';
 import { checkGhl, todaysAppointments } from './ghl.js';
@@ -140,8 +142,12 @@ app.delete('/api/decks/:slug', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// Streams progress while the two model passes run, so the console is not a
-// spinner for two minutes.
+// Queues a generation request and streams its status until it resolves.
+//
+// The server deliberately holds no Anthropic API key and never generates
+// anything itself. The Mac running Claude Code on the subscription claims the
+// job and does the work, so opening this in a browser can never spend API
+// credits. If no worker is running the job simply waits.
 app.get('/api/generate', requireAuth, async (req, res) => {
   const domain = normalizeDomain(req.query.domain);
 
@@ -152,35 +158,82 @@ app.get('/api/generate', requireAuth, async (req, res) => {
     'X-Accel-Buffering': 'no',
   });
   res.flushHeaders?.();
-
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
   if (!domain) {
     send('error', { message: 'That does not look like a domain. Try acme.com.' });
     return res.end();
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    send('error', { message: 'ANTHROPIC_API_KEY is not set on the server.' });
+
+  // Already have it? Hand it straight back rather than queueing a rebuild.
+  const existingSlug = (await listDecks(500)).find((d) => d.domain === domain);
+  if (existingSlug && req.query.force !== '1') {
+    send('progress', { message: `Already have a deck for ${domain}.` });
+    send('done', { slug: existingSlug.slug, company: existingSlug.company, url: `/d/${existingSlug.slug}` });
+    return res.end();
+  }
+
+  let job;
+  try {
+    const created = await createJob(domain);
+    job = created.job;
+    send('progress', {
+      message: created.reused
+        ? `Already queued for ${domain}, watching that one.`
+        : `Queued ${domain}. The Mac picks this up on its next check.`,
+    });
+  } catch (err) {
+    send('error', { message: err.message });
     return res.end();
   }
 
   const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15000);
+  let lastNote = null;
+  let closed = false;
+  req.on('close', () => { closed = true; });
 
-  try {
-    const data = await generateDeckData(domain, (msg) => send('progress', { message: msg }));
+  // Poll the job and report each change. The browser tab can be closed at any
+  // point without affecting the work: the job lives in the database.
+  const poll = setInterval(async () => {
+    if (closed) { clearInterval(poll); clearInterval(heartbeat); return; }
+    try {
+      const j = await getJob(job.id);
+      if (!j) return;
+      if (j.note && j.note !== lastNote) {
+        lastNote = j.note;
+        send('progress', { message: j.note });
+      }
+      if (j.status === 'done') {
+        clearInterval(poll); clearInterval(heartbeat);
+        send('done', { slug: j.slug, company: j.domain, url: `/d/${j.slug}` });
+        res.end();
+      } else if (j.status === 'failed') {
+        clearInterval(poll); clearInterval(heartbeat);
+        send('error', { message: j.error || 'Generation failed on the worker.' });
+        res.end();
+      }
+    } catch { /* transient, try again on the next tick */ }
+  }, 3000);
+});
 
-    const slug = slugify(data.company?.name, domain);
-    const company = data.company?.name || domain;
-    await saveDeck({ slug, domain, company, data });
+// ---------------------------------------------------------------- worker api
+// Used by local/daily-run.mjs on the Mac. Password gated like everything else.
 
-    send('done', { slug, company, url: `/d/${slug}` });
-  } catch (err) {
-    console.error('generate failed:', err);
-    send('error', { message: err.message || 'Generation failed.' });
-  } finally {
-    clearInterval(heartbeat);
-    res.end();
-  }
+app.post('/api/jobs/claim', requireAuth, async (req, res) => {
+  await requeueStale();
+  const job = await claimJob();
+  res.json({ job: job || null });
+});
+
+app.patch('/api/jobs/:id', requireAuth, async (req, res) => {
+  const { status, note, slug, error } = req.body || {};
+  const job = await updateJob(req.params.id, { status, note, slug, error });
+  if (!job) return res.status(404).json({ error: 'No such job.' });
+  res.json({ job });
+});
+
+app.get('/api/jobs', requireAuth, async (req, res) => {
+  res.json({ jobs: await listJobs() });
 });
 
 // ---------------------------------------------------------------- decks
