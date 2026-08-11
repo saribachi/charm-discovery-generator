@@ -6,6 +6,11 @@
 // companies, which makes that blast radius worth constraining.
 //
 // Sends nothing unless SLACK_WEBHOOK_URL is set.
+//
+// The message is a pre-call brief, not a pipeline status report. Everything
+// substantive in it is read out of the deck JSON that was already generated on
+// the Mac via the Claude subscription. Building this message calls no model and
+// needs no API key.
 
 const BASE_URL = process.env.PUBLIC_BASE_URL || 'https://discovery.hirecharm.com';
 
@@ -36,97 +41,159 @@ function dateLabel(ymd, tz) {
   }
 }
 
+// "Acme Corp & Charm" is how the booking calendar names every meeting, so the
+// suffix carries no information and costs a line of width.
+function personName(item) {
+  return (
+    (item.title || '')
+      .replace(/\s*&\s*Charm\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim() ||
+    item.who ||
+    item.domain ||
+    'unknown'
+  );
+}
+
+function trim(text, max) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return s.length > max ? s.slice(0, max - 1).trimEnd() + '...' : s;
+}
+
 // Turn a pre-warm report into the exact text that would be posted.
+//
+// One chronological list of today's calls, because that is the order the day
+// actually happens in. Each call carries its own state rather than being sorted
+// into Ready / Building / No deck buckets, which made a three-call day read as
+// three unrelated lists.
 export function buildDigest(report, tz = 'America/Los_Angeles') {
-  const ready = [...(report.generated || []), ...(report.reused || [])].sort((a, b) =>
-    String(a.when).localeCompare(String(b.when))
-  );
-  // Queued means the request is waiting on the Mac, which is a different state
-  // from "we cannot do this", so it gets its own section.
-  const queued = [...(report.queued || [])].sort((a, b) =>
-    String(a.when).localeCompare(String(b.when))
-  );
-  const problems = [
-    ...(report.skipped || []).map((s) => ({ ...s, kind: 'skipped' })),
-    ...(report.failed || []).map((f) => ({ ...f, kind: 'failed' })),
+  const calls = [
+    ...(report.generated || []).map((c) => ({ ...c, state: 'ready' })),
+    ...(report.reused || []).map((c) => ({ ...c, state: 'ready' })),
+    ...(report.queued || []).map((c) => ({ ...c, state: 'building' })),
+    ...(report.skipped || []).map((c) => ({ ...c, state: 'skipped' })),
+    ...(report.failed || []).filter((f) => f.when || f.domain).map((c) => ({ ...c, state: 'failed' })),
   ].sort((a, b) => String(a.when).localeCompare(String(b.when)));
 
-  const lines = [];
-  lines.push(`*Today's readings* · ${dateLabel(report.date, tz)}`);
+  // A run-level failure has no meeting attached to it. It has to be said before
+  // any count, because a calendar that did not answer means "0 calls" is not a
+  // fact about the day, it is the absence of one.
+  const runLevel = (report.failed || []).filter((f) => !f.when && !f.domain);
 
-  const n = report.meetings || 0;
+  const lines = [];
+  lines.push(`*Today's calls* · ${dateLabel(report.date, tz)}`);
+
+  if (runLevel.length) {
+    lines.push('');
+    for (const f of runLevel) lines.push(`:warning: ${humanError(f.error)}`);
+    if (!calls.length) return lines.join('\n');
+  }
+
+  if (!calls.length) {
+    lines.push('');
+    lines.push('_Nothing booked today._');
+    return lines.join('\n');
+  }
+
+  const ready = calls.filter((c) => c.state === 'ready').length;
+  const n = calls.length;
   lines.push(
-    `${n} meeting${n === 1 ? '' : 's'} · ${ready.length} deck${ready.length === 1 ? '' : 's'} ready` +
-      (queued.length ? ` · ${queued.length} building` : '') +
-      (problems.length ? ` · ${problems.length} need${problems.length === 1 ? 's' : ''} a look` : '')
+    `${n} call${n === 1 ? '' : 's'} · ${ready} deck${ready === 1 ? '' : 's'} ready`
   );
 
-  if (ready.length) {
+  for (const c of calls) {
     lines.push('');
-    lines.push('*Ready*');
-    for (const r of ready) {
-      const who = (r.title || '').replace(/\s*&\s*Charm\s*$/i, '').replace(/\s+/g, ' ').trim() || r.domain;
-      lines.push(`• ${timeLabel(r.when, tz)}  ${who} · ${r.domain}  <${BASE_URL}/d/${r.slug}|open deck>`);
-    }
-  }
+    const head = `*${timeLabel(c.when, tz)}  ${personName(c)}*${c.domain ? ` · ${c.domain}` : ''}`;
+    lines.push(head);
 
-  if (queued.length) {
-    lines.push('');
-    lines.push('*Building*');
-    for (const q of queued) {
-      const who = (q.title || '').replace(/\s*&\s*Charm\s*$/i, '').replace(/\s+/g, ' ').trim() || q.domain;
-      lines.push(`• ${timeLabel(q.when, tz)}  ${who} · ${q.domain}  _queued, generating on the Mac_`);
+    if (c.state === 'ready' && c.brief) {
+      renderBrief(lines, c);
+    } else if (c.state === 'ready') {
+      // A deck exists but its JSON could not be summarised. Still give the link.
+      lines.push(`<${BASE_URL}/d/${c.slug}|open deck>`);
+    } else if (c.state === 'building') {
+      lines.push('_No deck yet. Queued, and the Mac builds it in about ten minutes._');
+    } else if (c.state === 'skipped') {
+      lines.push(`_${humanReason(c.reason, c)}_`);
+    } else {
+      lines.push(`_${humanError(c.error)}_`);
     }
-  }
-
-  if (problems.length) {
-    lines.push('');
-    lines.push('*No deck*');
-    for (const p of problems) {
-      const who = (p.title || '').replace(/\s*&\s*Charm\s*$/i, '').replace(/\s+/g, ' ').trim() || p.who || p.domain || 'unknown';
-      const why =
-        p.kind === 'failed'
-          ? `${p.domain ? p.domain + ': ' : ''}${humanError(p.error)}`
-          : humanReason(p.reason, p);
-      lines.push(`• ${timeLabel(p.when, tz)}  ${who} — ${why}`);
-    }
-  }
-
-  if (!ready.length && !problems.length && !queued.length) {
-    lines.push('');
-    lines.push('_No meetings booked today._');
   }
 
   return lines.join('\n');
 }
 
-// Turn an API error into something a person reads at 8am. Raw JSON in a team
-// channel is noise, and it leaks request ids into a shared surface.
+// The substance of the message. Everything here was written during generation
+// and is only being read back out of storage.
+function renderBrief(lines, c) {
+  const b = c.brief || {};
+
+  if (b.oneLiner) lines.push(trim(b.oneLiner, 160));
+  if (b.gap) lines.push(`*The read:* ${trim(b.gap, 220)}`);
+  if (b.question) lines.push(`*Ask:* ${trim(b.question, 220)}`);
+
+  const bits = [];
+  if (b.signals) {
+    bits.push(
+      b.wincing
+        ? `${b.signals} signals, ${b.wincing} of them wincing`
+        : `${b.signals} signals`
+    );
+  }
+  if (b.sources) bits.push(`${b.sources} sources`);
+  bits.push(`<${BASE_URL}/d/${c.slug}|open deck>`);
+  if (b.hasBrief) bits.push(`<${BASE_URL}/d/${c.slug}/brief|research>`);
+  lines.push(bits.join(' · '));
+}
+
+// Pull the handful of fields worth reading at 8am out of a stored deck. Kept
+// here so the shape of the message and the shape of its inputs live together.
+export function summarizeDeck(row) {
+  const d = row?.data;
+  if (!d) return null;
+  const signals = Array.isArray(d.signals) ? d.signals : [];
+  return {
+    company: d.company?.name || row.company || row.domain,
+    oneLiner: d.company?.one_liner || '',
+    gap: d.read?.gap || '',
+    question: d.read?.question || '',
+    signals: signals.length,
+    wincing: signals.filter((s) => s?.loudness === 'wincing').length,
+    sources: Array.isArray(d.sources) ? d.sources.length : 0,
+    hasBrief: Boolean(d._brief),
+  };
+}
+
+// The server holds no Anthropic API key and never calls the model: generation
+// happens on the Mac against the Claude subscription. So the only failures that
+// can reach this digest are the calendar and the database. Anything mentioning
+// API keys, credits or rate limits was left over from the old architecture and
+// was reported every morning for a failure that could not be acted on.
 function humanError(err) {
   const raw = String(err || 'unknown error');
-  if (/credit balance is too low/i.test(raw)) {
-    return 'out of Anthropic API credits, top up at platform.claude.com';
+  if (/ghl|leadconnector|calendar|appointment/i.test(raw)) {
+    return 'could not read the booking calendar, so today may be incomplete';
   }
-  if (/rate.?limit|429/i.test(raw)) return 'hit the Anthropic rate limit, will retry tomorrow';
-  if (/timed out|timeout/i.test(raw)) return 'research took too long and timed out';
-  if (/authentication|invalid.?api.?key|401/i.test(raw)) return 'Anthropic API key was rejected';
-  if (/overloaded|529/i.test(raw)) return 'Anthropic API was overloaded';
-  if (/declined by safety|refusal/i.test(raw)) return 'the research was declined, try this one by hand';
-
-  // Unknown error: pull the API's message field if there is one, and keep it short.
+  if (/econnrefused|etimedout|database|postgres|pool/i.test(raw)) {
+    return 'could not reach the database, so no deck was requested';
+  }
   const m = raw.match(/"message"\s*:\s*"([^"]+)"/);
-  const text = (m ? m[1] : raw).replace(/\s+/g, ' ').trim();
-  return 'generation failed: ' + (text.length > 140 ? text.slice(0, 137) + '...' : text);
+  return 'could not be queued: ' + trim(m ? m[1] : raw, 140);
 }
 
 function humanReason(reason, p) {
   const r = String(reason || '');
   if (r.startsWith('free email provider')) {
-    return `booked with a personal email (${p.who || 'no company address'}), no company site to research`;
+    return `Booked from a personal address (${p.who || 'no company email'}), so there is no company site to research. Add a mapping to PREWARM_EMAIL_DOMAINS if you want a deck.`;
   }
-  if (r === 'on the skip list') return 'domain is on the skip list';
-  if (r === 'domain does not respond') return `${p.domain} did not respond, so it was not researched`;
-  if (r.startsWith('no website field')) return 'no website on the contact and no email to work from';
+  if (r === 'on the skip list') return 'Domain is on the skip list, no deck built.';
+  if (r === 'domain does not respond') {
+    return `${p.domain || 'That domain'} did not respond, so it was not researched.`;
+  }
+  if (r.startsWith('no website field')) {
+    return 'No website on the contact and no company email to work from.';
+  }
   return r;
 }
 

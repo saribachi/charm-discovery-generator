@@ -153,7 +153,9 @@ async function main() {
   if (!dryRes.ok) throw new Error(`server dry run failed: ${dryRes.status}`);
   const plan = await dryRes.json();
 
-  const needed = plan.generated || [];        // dry run marks these as "would generate"
+  // A dry run reports what it would ask for as "queued", since queueing is all a
+  // real run can do. Older servers put these under "generated", so accept both.
+  const needed = (plan.queued?.length ? plan.queued : plan.generated) || [];
 
   // Scheduled runs happen every 30 minutes, so they only narrate when there is
   // actually work to do. Otherwise the log is unreadable within a day.

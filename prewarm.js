@@ -10,8 +10,8 @@ import {
   customFieldNames,
   domainResolves,
 } from './ghl.js';
-import { listDecks, createJob } from './store.js';
-import { sendDigest } from './slack.js';
+import { listDecks, getDeck, createJob } from './store.js';
+import { sendDigest, summarizeDeck } from './slack.js';
 
 const TZ = process.env.PREWARM_TZ || 'America/Los_Angeles';
 
@@ -141,8 +141,11 @@ export async function runPrewarm({ dryRun = false, notify = false } = {}) {
       }
 
       if (dryRun) {
-        report.generated.push({ when, title, domain, via, slug: '(dry run)' });
-        console.log(`prewarm: would generate ${domain} (via ${via})`);
+        // Queued, not generated: a real run cannot produce a deck on the spot,
+        // it can only ask the Mac for one. Reporting these as ready made the
+        // digest preview look healthy while the real message showed failures.
+        report.queued.push({ when, title, domain, via, dryRun: true });
+        console.log(`prewarm: would queue ${domain} (via ${via})`);
         continue;
       }
 
@@ -173,10 +176,31 @@ export async function runPrewarm({ dryRun = false, notify = false } = {}) {
       `skipped=${report.skipped.length} failed=${report.failed.length}`
   );
 
+  // Read the summary fields back out of each deck that exists, so the digest can
+  // be a pre-call brief rather than a pipeline status line. This is storage
+  // reads only: the decks were written earlier by the Mac on the subscription,
+  // and nothing here calls a model.
+  await attachBriefs(report);
+
   // Only ever posts on a real run that explicitly asked for it.
   if (notify && !dryRun) report.slack = await sendDigest(report, TZ);
 
   return report;
+}
+
+// A handful of decks a day, so loading each one whole is cheaper than teaching
+// the store to project JSON fields in two different backends. A deck that fails
+// to summarise still gets its link, so this can never cost us the message.
+async function attachBriefs(report) {
+  for (const item of [...report.generated, ...report.reused]) {
+    if (!item.slug) continue;
+    try {
+      const brief = summarizeDeck(await getDeck(item.slug));
+      if (brief) item.brief = brief;
+    } catch (err) {
+      console.warn(`prewarm: could not summarise ${item.slug}: ${err.message}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- scheduler
