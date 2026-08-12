@@ -59,33 +59,40 @@ to a slide.
 
 ## How generation works
 
-Two model passes, both `claude-opus-5`.
+**The server holds no Anthropic API key and cannot generate anything.** Opening
+the console in a browser can never spend API credits. A request becomes a job in
+a queue; the Mac running Claude Code on the Claude subscription claims it, does
+the work, and imports the result. See `local/README.md`.
 
-**Pass 1, research** (`research.js` → `researchPass`). Web search plus web fetch,
-capped at 12 searches and 10 fetches. Produces a factual brief: what they do, who
-they sell to, TAM shape, deal shape, observable go-to-market, market pressure,
-five buying signals, risks, sources. The prompt forbids inventing customers,
-headcounts, funding, or metrics, and requires "unknown" where it cannot verify.
-Handles `pause_turn` by resuming, up to 5 continuations.
+Historically this ran as two API passes on the server (`research.js`, removed in
+Aug 2026). Git history has it if the API route is ever wanted again.
 
-**Pass 2, write** (`writePass`). No tools. Takes the brief and returns deck copy
-constrained to `DECK_SCHEMA` via structured outputs. The system prompt carries the
-Charm brand kit, the lexicon, and the fixed narrative from `brand.js`.
-
-The two are split so the schema-constrained call never has to deal with server
-tool pausing, and so the research prompt can be tuned without touching the writer.
+Generation is a single Claude Code pass, because Claude Code has WebSearch and
+WebFetch built in. The prompt carries the Charm brand kit, lexicon and fixed
+narrative from `brand.js`, forbids inventing customers, headcounts, funding or
+metrics, and requires the model to work around anything it cannot verify.
 
 Everything is scrubbed for em dashes on the way out, because the model will
 occasionally sneak one in despite the instruction.
 
-The raw research brief is kept and readable at `/d/<slug>/brief` (password gated),
-so Chris can skim the facts before the call.
+### The queue
+
+| Step | Where |
+| --- | --- |
+| Browser asks for a domain, or the 08:00 run finds a meeting without a deck | Server: creates a job |
+| Job is claimed and generated | Mac: Claude Code on the subscription |
+| Finished deck is imported | Mac posts to `/api/decks/import` |
+| Browser sees it appear | Server streams job status over SSE |
+
+Closing the browser tab does not cancel anything: the job lives in the database.
+If the Mac is off, jobs simply wait. A job stuck `running` for more than 40
+minutes is automatically requeued, on the assumption the worker went away.
 
 ## Daily GHL pre-warm
 
 Each morning the app reads that day's GoHighLevel appointments, resolves each
-booker's website, and generates a deck for anyone who does not already have a
-fresh one. Decks land silently in the console. Nothing is sent anywhere.
+booker's website, and queues a deck for anyone who does not already
+have a fresh one. Decks land silently in the console. Nothing is sent anywhere.
 
 **Off by default.** With no `GHL_TOKEN` the scheduler never starts and the app
 behaves exactly as before.
@@ -116,13 +123,14 @@ pitch.
 | --- | --- |
 | `GET /api/prewarm/check` | Proves the token works and prints what GHL returns. Generates nothing. |
 | `GET /api/prewarm/dry` | Full run without generating: which meetings, which domains, what it would skip. Spends nothing. |
-| `POST /api/prewarm/run` | Fires the real job now. Returns immediately, generates in the background. |
+| `POST /api/prewarm/run` | Fires the real run now. Queues anything missing. |
 | `GET /api/prewarm/state` | Whether a run is in flight and when it last ran. |
+| `GET /api/jobs` | The generation queue and its status. |
 
 **Timing.** Defaults to 08:00 `America/Los_Angeles` via `PREWARM_HOUR` /
-`PREWARM_MINUTE` / `PREWARM_TZ`. Note a deck takes 4 to 13 minutes, so a full
-morning of meetings can take a while. If Chris has early calls, move the hour
-earlier so the decks are ready rather than still building.
+`PREWARM_MINUTE` / `PREWARM_TZ`. The Mac checks the queue every two minutes, so
+in practice decks are usually already built by then. A deck takes 4 to 13
+minutes to generate.
 
 DST is handled by reading the real UTC offset from `Intl`, so the day window is
 23 hours on spring-forward and 25 on fall-back rather than a naive 24.
@@ -138,7 +146,7 @@ DST is handled by reading the real UTC offset from `Intl`, so the day window is
 
 ```sh
 npm install
-cp .env.example .env      # fill in ANTHROPIC_API_KEY and APP_PASSWORD
+cp .env.example .env      # fill in APP_PASSWORD (no API key: see local/README.md)
 export $(grep -v '^#' .env | xargs)
 npm start                 # http://localhost:3000
 ```
@@ -152,8 +160,9 @@ Matches the pattern used by `charm-content-pipeline` and `charm-disco-booked`.
 
 1. Push this directory to a GitHub repo.
 2. New application in Coolify, Dockerfile buildpack, port 3000.
-3. Environment variables: `ANTHROPIC_API_KEY`, `APP_PASSWORD`, and optionally
-   `SESSION_SECRET`.
+3. Environment variables: `APP_PASSWORD`, `SESSION_SECRET`, `GHL_TOKEN`,
+   `GHL_LOCATION_ID`, `SLACK_WEBHOOK_URL`. **Deliberately no `ANTHROPIC_API_KEY`**:
+   the server must not be able to spend API credits.
 4. Link a Postgres service so Coolify injects `DATABASE_URL`. Without it the
    file store works but decks are lost on redeploy, since there is no volume.
 5. DNS: `discovery` A record on the `hirecharm.com` Cloudflare zone pointing at
@@ -164,16 +173,15 @@ Matches the pattern used by `charm-content-pipeline` and `charm-disco-booked`.
 
 ## Cost
 
-Roughly a few cents to about twenty cents per deck, depending on how much the
-research pass searches. Both passes run at `effort: high`. Drop the writing pass
-to `medium` in `research.js` if you want to trim it.
+Roughly $1 to $3 of usage per deck, measured on real runs. This is charged
+against the Claude subscription rather than billed as API spend, because the
+server has no API key.
 
 ## Files
 
 | File | What it does |
 | --- | --- |
-| `server.js` | Routes, auth, SSE progress stream |
-| `research.js` | The two Claude passes and the deck schema |
+| `server.js` | Routes, auth, job queue, SSE status stream |
 | `deck.js` | Renders deck data into a self-contained HTML deck |
 | `brand.js` | Brand tokens, voice rules, the fixed narrative |
 | `store.js` | Postgres, or a JSON file when there is no `DATABASE_URL` |

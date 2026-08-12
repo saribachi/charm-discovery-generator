@@ -4,3 +4,4 @@ data/
 .DS_Store
 local/prewarm.log
 local/preview.html
+local/.last-ghl-check

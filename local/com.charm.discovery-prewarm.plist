@@ -25,12 +25,12 @@
     <string>/Users/sarahbachmeier/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 
-  <!-- Run every 30 minutes rather than once at 06:30. The job is idempotent:
-       it skips decks that already exist and exits in about two seconds when
-       there is nothing to do. So whenever the Mac is on, it catches up within
-       half an hour instead of missing the day entirely. -->
+  <!-- Every two minutes. Most runs only check the job queue, which is one cheap
+       HTTP call, so a request made in the browser is picked up almost straight
+       away. The GHL calendar check inside is separately rate limited to once
+       every 20 minutes. Exits in about a second when there is nothing to do. -->
   <key>StartInterval</key>
-  <integer>1800</integer>
+  <integer>120</integer>
 
   <!-- Also run the moment the agent loads, which is at login. A Mac that was
        off overnight starts catching up as soon as you sit down at it. -->

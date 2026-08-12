@@ -27,6 +27,20 @@ export async function initStore() {
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
       )
     `);
+    // Generation requests waiting for a worker. The server never generates:
+    // it queues, and the Mac running Claude Code on the subscription drains it.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jobs (
+        id          TEXT PRIMARY KEY,
+        domain      TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        note        TEXT,
+        slug        TEXT,
+        error       TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
     console.log('store: postgres');
   } else {
     await fs.mkdir(path.dirname(FILE_PATH), { recursive: true });
@@ -88,6 +102,134 @@ export async function listDecks(limit = 60) {
     .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
     .slice(0, limit)
     .map(({ slug, domain, company, created_at }) => ({ slug, domain, company, created_at }));
+}
+
+// ---------------------------------------------------------------- job queue
+//
+// The server has no way to generate a deck: it holds no API key by design.
+// A request from the browser becomes a job here, and the Mac running Claude
+// Code on the subscription claims it, generates, and imports the result.
+
+const JOBS_PATH = path.join(__dirname, 'data', 'jobs.json');
+
+async function readJobs() {
+  try {
+    return JSON.parse(await fs.readFile(JOBS_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+async function writeJobs(all) {
+  await fs.mkdir(path.dirname(JOBS_PATH), { recursive: true });
+  await fs.writeFile(JOBS_PATH, JSON.stringify(all, null, 2));
+}
+
+export async function createJob(domain) {
+  const id = 'job_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  const now = new Date().toISOString();
+  if (usePg) {
+    // One live job per domain: re-asking while one is in flight returns it.
+    const existing = await pool.query(
+      `SELECT * FROM jobs WHERE domain = $1 AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`,
+      [domain]
+    );
+    if (existing.rows[0]) return { job: existing.rows[0], reused: true };
+    const { rows } = await pool.query(
+      `INSERT INTO jobs (id, domain, status, note) VALUES ($1, $2, 'queued', $3) RETURNING *`,
+      [id, domain, 'Waiting for the Mac to pick this up.']
+    );
+    return { job: rows[0], reused: false };
+  }
+  const all = await readJobs();
+  const live = Object.values(all).find((j) => j.domain === domain && ['queued', 'running'].includes(j.status));
+  if (live) return { job: live, reused: true };
+  all[id] = { id, domain, status: 'queued', note: 'Waiting for the Mac to pick this up.', created_at: now, updated_at: now };
+  await writeJobs(all);
+  return { job: all[id], reused: false };
+}
+
+export async function getJob(id) {
+  if (usePg) {
+    const { rows } = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    return rows[0] || null;
+  }
+  return (await readJobs())[id] || null;
+}
+
+export async function listJobs(limit = 50) {
+  if (usePg) {
+    const { rows } = await pool.query('SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1', [limit]);
+    return rows;
+  }
+  return Object.values(await readJobs())
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
+    .slice(0, limit);
+}
+
+// Atomically hand the oldest queued job to a worker.
+export async function claimJob() {
+  if (usePg) {
+    const { rows } = await pool.query(
+      `UPDATE jobs SET status = 'running', note = 'Researching and writing on the Mac.', updated_at = now()
+         WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1
+                     FOR UPDATE SKIP LOCKED)
+       RETURNING *`
+    );
+    return rows[0] || null;
+  }
+  const all = await readJobs();
+  const next = Object.values(all)
+    .filter((j) => j.status === 'queued')
+    .sort((a, b) => (a.created_at < b.created_at ? -1 : 1))[0];
+  if (!next) return null;
+  next.status = 'running';
+  next.note = 'Researching and writing on the Mac.';
+  next.updated_at = new Date().toISOString();
+  await writeJobs(all);
+  return next;
+}
+
+export async function updateJob(id, patch) {
+  if (usePg) {
+    const { rows } = await pool.query(
+      `UPDATE jobs SET status = COALESCE($2, status), note = COALESCE($3, note),
+              slug = COALESCE($4, slug), error = COALESCE($5, error), updated_at = now()
+         WHERE id = $1 RETURNING *`,
+      [id, patch.status ?? null, patch.note ?? null, patch.slug ?? null, patch.error ?? null]
+    );
+    return rows[0] || null;
+  }
+  const all = await readJobs();
+  if (!all[id]) return null;
+  Object.assign(all[id], patch, { updated_at: new Date().toISOString() });
+  await writeJobs(all);
+  return all[id];
+}
+
+// Anything left running far longer than a generation takes is a worker that
+// died or a Mac that went to sleep mid-job. Put it back so it is not stuck.
+export async function requeueStale(maxMinutes = 40) {
+  const cutoff = Date.now() - maxMinutes * 60000;
+  if (usePg) {
+    const { rowCount } = await pool.query(
+      `UPDATE jobs SET status = 'queued', note = 'Requeued after the worker went away.', updated_at = now()
+         WHERE status = 'running' AND updated_at < $1`,
+      [new Date(cutoff).toISOString()]
+    );
+    return rowCount;
+  }
+  const all = await readJobs();
+  let n = 0;
+  for (const j of Object.values(all)) {
+    if (j.status === 'running' && new Date(j.updated_at).getTime() < cutoff) {
+      j.status = 'queued';
+      j.note = 'Requeued after the worker went away.';
+      j.updated_at = new Date().toISOString();
+      n++;
+    }
+  }
+  if (n) await writeJobs(all);
+  return n;
 }
 
 export async function deleteDeck(slug) {
