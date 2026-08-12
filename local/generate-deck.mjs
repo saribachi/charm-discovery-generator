@@ -46,6 +46,11 @@ RULES FOR THE COPY:
 - Every field is prospect-specific. If a line would read the same for any
   company, rewrite it.
 - Deck copy, not prose. Slide lines are short.
+- The deck no longer shows their ICP, their TAM size, or a market segmentation.
+  You still produce icp and tam below and should use them to reason, but do
+  NOT write copy that points at them as if the prospect has seen them. No "your
+  three segments", no "the 11,400 companies we mapped". Nothing on a slide may
+  assume the prospect has been shown a breakdown of their own market.
 - signals is the heart of the deck. Mix loud signals ("screaming": stated
   openly, a job post, an RFP, a public award) with quiet ones ("wincing": only
   visible if you are watching, headcount drift, a quiet tooling swap, a
